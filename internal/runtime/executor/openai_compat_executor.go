@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	openaiclaude "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -426,7 +427,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var param any
 		var streamUsage helps.StreamUsageBuffer
-		var seenDone bool
+		var seenDone, seenDataLine bool
 		defer streamUsage.Publish(ctx, reporter)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -460,6 +461,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// are not reordered ahead of the handler-emitted terminal marker.
 			dataPayload := bytes.TrimSpace(trimmedLine[len("data:"):])
 			isDone := bytes.Equal(dataPayload, []byte("[DONE]"))
+			if !isDone {
+				seenDataLine = true
+			}
 
 			// OpenAI-compatible streams must use SSE data lines.
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param, claudeInputTokens)
@@ -484,14 +488,33 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 		} else if !seenDone {
 			// Upstream closed without a terminal [DONE] marker.
-			// Feed a synthetic done marker through the translator so pending
-			// response.completed events are still emitted exactly once.
-			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param, claudeInputTokens)
-			for i := range chunks {
+			// Only feed a synthetic done marker if the response was completed cleanly
+			// or at least partially emitted. Otherwise, if the stream dropped prematurely
+			// without sending any payload, report a stream disconnection error instead
+			// of masking the interruption as a clean completion.
+			isCleanFinish := seenDataLine
+			if p, ok := param.(*openaiclaude.ConvertOpenAIResponseToAnthropicParams); ok {
+				if p.FinishReason == "" && !p.SawToolCall && !p.MessageStarted {
+					isCleanFinish = false
+				}
+			}
+
+			if isCleanFinish {
+				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param, claudeInputTokens)
+				for i := range chunks {
+					select {
+					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			} else {
+				streamErr := statusErr{code: http.StatusGatewayTimeout, msg: "openai compat stream error: stream disconnected before response completed"}
+				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+				reporter.PublishFailure(ctx, streamErr)
 				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 				case <-ctx.Done():
-					return
 				}
 			}
 		}

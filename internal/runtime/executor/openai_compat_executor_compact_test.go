@@ -965,3 +965,43 @@ func TestOpenAICompatExecutorStreamDropsChunksAfterDone(t *testing.T) {
 		t.Fatalf("second chunk = %s", payloads[1])
 	}
 }
+
+func TestOpenAICompatExecutorPrematureStreamDisconnectEmitsError(t *testing.T) {
+	// When an upstream OpenAI-compat stream drops without emitting any data payload or finish reason,
+	// ExecuteStream should emit a stream error chunk rather than a synthetic clean [DONE].
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(": thinking in progress\n\n"))
+		// Upstream drops connection cleanly (EOF) without writing any data payload
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-reasoner",
+		Payload: []byte(`{"model":"deepseek-reasoner","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var sawError bool
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			sawError = true
+			if !strings.Contains(chunk.Err.Error(), "stream disconnected before response completed") {
+				t.Fatalf("unexpected stream error msg: %v", chunk.Err)
+			}
+		}
+	}
+	if !sawError {
+		t.Fatalf("expected stream error chunk on premature stream drop, got none")
+	}
+}

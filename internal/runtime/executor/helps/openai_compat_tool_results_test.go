@@ -136,9 +136,10 @@ func TestEnsureOpenAICompatAssistantReasoningContent(t *testing.T) {
 			wantExists:    true,
 		},
 		{
-			name:       "assistant text only without tool_calls has no reasoning_content injected",
-			input:      `{"messages":[{"role":"assistant","content":"hello"}]}`,
-			wantExists: false,
+			name:          "assistant text only without tool_calls receives fallback reasoning_content",
+			input:         `{"messages":[{"role":"assistant","content":"hello"}]}`,
+			wantReasoning: "[reasoning unavailable]",
+			wantExists:    true,
 		},
 	}
 

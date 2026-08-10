@@ -204,8 +204,8 @@ func isOpenAICompatThinkingObjectDisabled(thinkingField gjson.Result) bool {
 	return strings.ToLower(strings.TrimSpace(thinkingField.Get("type").String())) == "disabled"
 }
 
-// EnsureOpenAICompatAssistantReasoningContent ensures every assistant message containing
-// tool_calls has a non-empty reasoning_content field to satisfy strict OpenAI-compatible
+// EnsureOpenAICompatAssistantReasoningContent ensures every assistant message in history
+// has a non-empty reasoning_content field to satisfy strict OpenAI-compatible
 // reasoning providers (e.g. DeepSeek, Kimi).
 func EnsureOpenAICompatAssistantReasoningContent(payload []byte) []byte {
 	messages := gjson.GetBytes(payload, "messages")
@@ -217,14 +217,11 @@ func EnsureOpenAICompatAssistantReasoningContent(payload []byte) []byte {
 	messageIndex := 0
 	messages.ForEach(func(_, message gjson.Result) bool {
 		if message.Get("role").String() == "assistant" {
-			toolCalls := message.Get("tool_calls")
-			if toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0 {
-				reasoning := message.Get("reasoning_content")
-				if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
-					path := fmt.Sprintf("messages.%d.reasoning_content", messageIndex)
-					if updated, errSet := sjson.SetBytes(out, path, "[reasoning unavailable]"); errSet == nil {
-						out = updated
-					}
+			reasoning := message.Get("reasoning_content")
+			if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
+				path := fmt.Sprintf("messages.%d.reasoning_content", messageIndex)
+				if updated, errSet := sjson.SetBytes(out, path, "[reasoning unavailable]"); errSet == nil {
+					out = updated
 				}
 			}
 		}
